@@ -2,7 +2,7 @@
 # ═══════════════════════════════════════════════════════════
 #   Free Fire Account Generator + Play Check — Vercel
 #   Developer : @KINGFFAIAK47x
-#   URL format: /api/lookup/<id>=<api_key>?region=IND
+#   URL: /api/lookup/<id>=<api_key>?region=IND[&jwt=eyJ...]
 # ═══════════════════════════════════════════════════════════
 import os
 import sys
@@ -30,16 +30,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 #  CONFIG
 # ═══════════════════════════════════════════════════════════
 DEVELOPER           = "@KINGFFAIAK47x"
-API_KEY             = os.environ.get("FF_API_KEY", "AKJMA")          # NEVER returned
+API_KEY             = os.environ.get("FF_API_KEY", "AKJMA")
 DEFAULT_REGION      = os.environ.get("FF_DEFAULT_REGION", "IND")
 VALID_REGIONS       = {"IND", "SAC", "US", "BR", "ME"}
 DEFAULT_BAN_RETRIES = int(os.environ.get("FF_BAN_RETRIES", "3"))
 
 IS_VERCEL   = bool(os.environ.get("VERCEL"))
-OUTPUT_FILE = os.environ.get(
-    "FF_OUTPUT_FILE",
-    "/tmp/accounts.json" if IS_VERCEL else "accounts.json"
-)
+OUTPUT_FILE = os.environ.get("FF_OUTPUT_FILE",
+                             "/tmp/accounts.json" if IS_VERCEL else "accounts.json")
 
 
 def log_info(m):  print(f"[i] {m}", flush=True)
@@ -91,12 +89,14 @@ FIELD_22_HEX = (
     "fbe3fcc279c6147c5bf91cd43cdc9704236"
 )
 
+# ⚠️ CRITICAL FIX #1 — NO cross-region fallback.
+# Each region uses ONLY its own host. No US fallback for IND.
 PLAYER_INFO_HOSTS = {
-    "SAC": ["client.sac.freefiremobile.com", "client.us.freefiremobile.com", "clientbp.ggpolarbear.com"],
-    "IND": ["client.ind.freefiremobile.com", "client.us.freefiremobile.com", "clientbp.ggpolarbear.com"],
-    "US":  ["client.us.freefiremobile.com",  "client.sac.freefiremobile.com", "clientbp.ggpolarbear.com"],
-    "BR":  ["client.br.freefiremobile.com",  "client.us.freefiremobile.com",  "clientbp.ggpolarbear.com"],
-    "ME":  ["client.me.freefiremobile.com",  "client.us.freefiremobile.com",  "clientbp.ggpolarbear.com"],
+    "IND": ["client.ind.freefiremobile.com"],
+    "SAC": ["client.sac.freefiremobile.com"],
+    "US":  ["client.us.freefiremobile.com"],
+    "BR":  ["client.br.freefiremobile.com"],
+    "ME":  ["client.me.freefiremobile.com"],
 }
 
 VERIFIED_FIELDS = [
@@ -110,6 +110,33 @@ VERIFIED_FIELDS = [
     ("banner_id",    ["2.3"]),
     ("open_id",      ["2.4"]),
 ]
+
+
+# ═══════════════════════════════════════════════════════════
+#  IN-MEMORY JWT CACHE  (survives across Vercel Lambda reuse)
+# ═══════════════════════════════════════════════════════════
+_jwt_cache = {}          # {region: (jwt, timestamp)}
+_jwt_cache_lock = threading.Lock()
+JWT_CACHE_TTL = 300      # 5 minutes
+
+
+def cache_get_jwt(region):
+    with _jwt_cache_lock:
+        entry = _jwt_cache.get(region)
+        if not entry:
+            return None
+        jwt, ts = entry
+        if time.time() - ts > JWT_CACHE_TTL:
+            del _jwt_cache[region]
+            return None
+        return jwt
+
+
+def cache_set_jwt(region, jwt):
+    if not jwt:
+        return
+    with _jwt_cache_lock:
+        _jwt_cache[region] = (jwt, time.time())
 
 
 # ═══════════════════════════════════════════════════════════
@@ -150,7 +177,7 @@ def save_account(account):
 
 
 # ═══════════════════════════════════════════════════════════
-#  PROTOBUF
+#  PROTOBUF WRITER
 # ═══════════════════════════════════════════════════════════
 def write_varint(v: int) -> bytes:
     if v < 0:
@@ -193,6 +220,9 @@ def assemble_proto(fields):
     return bytes(data)
 
 
+# ═══════════════════════════════════════════════════════════
+#  PROTOBUF READER
+# ═══════════════════════════════════════════════════════════
 def read_varint(data, offset):
     r, s = 0, 0
     while True:
@@ -363,7 +393,7 @@ def parse_proto_rich(data, depth=0, max_depth=6):
 
 
 # ═══════════════════════════════════════════════════════════
-#  AES
+#  AES + XOR
 # ═══════════════════════════════════════════════════════════
 def aes_encrypt(plain):
     return AES.new(AES_KEY, AES.MODE_CBC, AES_IV).encrypt(pad(plain, AES.block_size))
@@ -621,13 +651,14 @@ def send_major_login(session, access_token, open_id, region_code, platform="4"):
 
 
 # ═══════════════════════════════════════════════════════════
-#  JWT CACHE
+#  JWT SOURCE PRIORITY:  user-supplied → cache → saved → ephemeral
 # ═══════════════════════════════════════════════════════════
-def _get_saved_jwt():
+def _get_saved_jwt(region):
     data = _load_accounts()
     for acc in reversed(data):
         jwt = acc.get("jwt")
-        if isinstance(jwt, str) and jwt.startswith("eyJ"):
+        if (isinstance(jwt, str) and jwt.startswith("eyJ")
+                and (not region or acc.get("region") == region)):
             return jwt, acc
     return None, None
 
@@ -654,6 +685,7 @@ def _refresh_account_jwt(acc, region_code=None):
         acc["jwt_refreshed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         acc["banned"] = False
         save_account(acc)
+        cache_set_jwt(region_code, jwt)
         return jwt
     except Exception as e:
         log_debug(f"jwt refresh failed: {e}")
@@ -661,7 +693,24 @@ def _refresh_account_jwt(acc, region_code=None):
 
 
 # ═══════════════════════════════════════════════════════════
-#  PLAYER INFO
+#  GET EPHEMERAL JWT  (throwaway — never saved)
+# ═══════════════════════════════════════════════════════════
+def get_ephemeral_jwt(region_code, retries=2):
+    """Create throwaway account purely for its JWT. Never saved."""
+    try:
+        acc = _generate_raw(region_code, retries=retries)
+        if acc and acc.get("jwt"):
+            log_info(f"ephemeral JWT created ({region_code})")
+            # small delay — let server propagate the new account
+            time.sleep(2)
+            return acc["jwt"]
+    except Exception as e:
+        log_warn(f"ephemeral jwt failed: {e}")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
+#  PLAYER INFO  (validates account_id matches)
 # ═══════════════════════════════════════════════════════════
 def _get(parsed, path):
     cur = parsed
@@ -690,6 +739,14 @@ def _get(parsed, path):
     return cur
 
 
+def _extract_response_account_id(parsed):
+    for path in ("6.3", "7.1", "9.1"):
+        v = _get(parsed, path)
+        if isinstance(v, int):
+            return v
+    return None
+
+
 def _try_parse_player_response(raw):
     candidates = []
     dec = aes_decrypt(raw)
@@ -712,15 +769,16 @@ def _try_parse_player_response(raw):
     return None
 
 
-def fetch_player_info(session, account_id, jwt=None, region=None, auto_jwt=True):
+def fetch_player_info(session, account_id, jwt, region, requested_aid=None):
+    """
+    Query GetPlayerPersonalShow.
+    requested_aid: original ID the caller asked for. If returned 6.3 != requested,
+                   the response is discarded as WRONG (server returned JWT-owner data).
+    """
     region = (region or DEFAULT_REGION).upper()
-    hosts = PLAYER_INFO_HOSTS.get(region, PLAYER_INFO_HOSTS["SAC"])
+    hosts = PLAYER_INFO_HOSTS.get(region, PLAYER_INFO_HOSTS["IND"])
     account_id = int(account_id)
-
-    if not jwt and auto_jwt:
-        jwt, acc = _get_saved_jwt()
-        if jwt:
-            log_debug(f"auto-loaded JWT from {acc.get('uid')}")
+    requested_aid = int(requested_aid if requested_aid is not None else account_id)
 
     payload_variants = [
         {1: account_id, 2: region},
@@ -728,7 +786,6 @@ def fetch_player_info(session, account_id, jwt=None, region=None, auto_jwt=True)
         {1: account_id},
     ]
     per_host_errors = {}
-    tried_jwt_refresh = False
 
     for host in hosts:
         url = f"https://{host}/GetPlayerPersonalShow"
@@ -747,17 +804,9 @@ def fetch_player_info(session, account_id, jwt=None, region=None, auto_jwt=True)
                     "X-Unity-Version": "2018.4.12f1",
                     "Content-Length": str(len(encrypted)),
                 }
-                r = session.post(url, headers=headers, data=encrypted, timeout=20, verify=False)
-                if r.status_code == 401 and jwt and not tried_jwt_refresh and auto_jwt:
-                    _, acc = _get_saved_jwt()
-                    if acc:
-                        log_warn("401 → refreshing JWT…")
-                        new_jwt = _refresh_account_jwt(acc, region)
-                        tried_jwt_refresh = True
-                        if new_jwt:
-                            jwt = new_jwt
-                            headers["Authorization"] = f"Bearer {jwt}"
-                            r = session.post(url, headers=headers, data=encrypted, timeout=20, verify=False)
+                r = session.post(url, headers=headers, data=encrypted,
+                                 timeout=20, verify=False)
+
                 if r.status_code != 200:
                     err = f"HTTP {r.status_code}"
                     if r.status_code == 401:
@@ -769,30 +818,45 @@ def fetch_player_info(session, account_id, jwt=None, region=None, auto_jwt=True)
                     if host_first_err is None:
                         host_first_err = "empty response"
                     continue
+
                 parsed = _try_parse_player_response(r.content)
-                if parsed:
-                    return parsed, host
-                if host_first_err is None:
-                    host_first_err = "decode failed"
+                if not parsed:
+                    if host_first_err is None:
+                        host_first_err = "decode failed"
+                    continue
+
+                # ⭐ CRITICAL FIX #2 — validate account_id matches
+                returned_aid = _extract_response_account_id(parsed)
+                if returned_aid is not None and returned_aid != requested_aid:
+                    msg = f"wrong account returned ({returned_aid} != {requested_aid})"
+                    log_warn(f"  {host}/v{pv_idx}: {msg} — discarding response")
+                    if host_first_err is None:
+                        host_first_err = msg
+                    continue
+
+                return parsed, host
+
             except requests.exceptions.ConnectionError as e:
                 msg = str(e)
-                host_first_err = "DNS failed" if ("NameResolutionError" in msg or "getaddrinfo" in msg) else "connection error"
+                host_first_err = ("DNS failed"
+                                  if ("NameResolutionError" in msg or "getaddrinfo" in msg)
+                                  else "connection error")
                 break
             except Exception as e:
                 if host_first_err is None:
                     host_first_err = str(e)[:80]
+
         if host_first_err:
             per_host_errors[host] = host_first_err
+
     if per_host_errors:
         detail = " | ".join(f"{h}: {e}" for h, e in per_host_errors.items())
-        if any("401" in e for e in per_host_errors.values()):
-            detail += "  →  401 = valid JWT needed"
         raise RuntimeError(detail)
     raise RuntimeError("player info failed — no host reachable")
 
 
 # ═══════════════════════════════════════════════════════════
-#  BAN CHECK
+#  BAN CHECK + SUMMARY
 # ═══════════════════════════════════════════════════════════
 def is_banned(parsed):
     if not parsed or len(parsed) < 2:
@@ -816,9 +880,9 @@ def extract_verified(parsed):
 
 
 # ═══════════════════════════════════════════════════════════
-#  GENERATE
+#  GENERATE (raw, never saves)
 # ═══════════════════════════════════════════════════════════
-def generate_one(region_code, retries=3, fetch_info=False):
+def _generate_raw(region_code, retries=3):
     session = new_session()
     password = hashlib.sha256(os.urandom(32)).hexdigest().upper()
 
@@ -852,7 +916,9 @@ def generate_one(region_code, retries=3, fetch_info=False):
         return None
     jwt, session_key, session_iv = login
 
-    account = {
+    cache_set_jwt(region_code, jwt)
+
+    return {
         "uid": uid, "password": password, "nickname": nickname,
         "open_id": open_id, "access_token": access_token,
         "account_id": account_id, "region": region_code, "jwt": jwt,
@@ -860,18 +926,25 @@ def generate_one(region_code, retries=3, fetch_info=False):
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "banned": False,
     }
-    log_ok(f"generated {uid}  nick={nickname}  acc_id={account_id}")
 
+
+def generate_one(region_code, retries=3, fetch_info=False):
+    acc = _generate_raw(region_code, retries=retries)
+    if not acc:
+        return None
+    log_ok(f"generated {acc['uid']}  nick={acc['nickname']}  acc_id={acc['account_id']}")
     if fetch_info:
         try:
-            info, host = fetch_player_info(session, account_id, jwt, region_code, auto_jwt=False)
-            account["player_info"] = info
-            account["player_info_host"] = host
-            account["verified"] = True
+            s = new_session()
+            info, host = fetch_player_info(s, acc["account_id"], acc["jwt"],
+                                            region_code,
+                                            requested_aid=acc["account_id"])
+            acc["player_info"] = info
+            acc["player_info_host"] = host
+            acc["verified"] = True
         except Exception as e:
             log_warn(f"info fetch failed: {e}")
-
-    return account
+    return acc
 
 
 def generate_with_ban_retry(region_code, retries=3, max_ban_retries=DEFAULT_BAN_RETRIES):
@@ -886,9 +959,11 @@ def generate_with_ban_retry(region_code, retries=3, max_ban_retries=DEFAULT_BAN_
             continue
 
         try:
-            time.sleep(1.2)
+            time.sleep(1.5)
             s = new_session()
-            info, host = fetch_player_info(s, acc["account_id"], acc["jwt"], region_code, auto_jwt=False)
+            info, host = fetch_player_info(s, acc["account_id"], acc["jwt"],
+                                            region_code,
+                                            requested_aid=acc["account_id"])
             banned, reason = is_banned(info)
             if banned:
                 log_warn(f"attempt {attempt}: BANNED ({reason}) — retrying")
@@ -906,16 +981,6 @@ def generate_with_ban_retry(region_code, retries=3, max_ban_retries=DEFAULT_BAN_
             continue
 
     log_err(f"all {max_ban_retries} attempts failed for {region_code}")
-    return None
-
-
-def get_ephemeral_jwt(region_code, retries=2):
-    try:
-        acc = generate_one(region_code, retries=retries, fetch_info=False)
-        if acc and acc.get("jwt"):
-            return acc["jwt"]
-    except Exception as e:
-        log_warn(f"ephemeral jwt failed: {e}")
     return None
 
 
@@ -995,17 +1060,9 @@ def index():
         "ok": True,
         "service": "FreeFire Account Generator + Play Check",
         "developer": DEVELOPER,
-        "version": "1.2.0",
-        "vercel": IS_VERCEL,
-        "lookup_url_example": "/api/lookup/206746194=YOUR_KEY?region=IND",
-        "endpoints": {
-            "GET  /api/health":                       "health check (no key)",
-            "GET  /api/lookup/<id>=<key>?region=IND": "play-check (UID or account_id)",
-            "POST /api/generate":                     "generate accounts",
-            "GET  /api/accounts":                     "list saved accounts",
-            "POST /api/refresh":                      "refresh JWT",
-        },
-        "auth": "append =YOUR_KEY in URL path OR X-API-Key header",
+        "version": "1.3.0",
+        "lookup_example": "/api/lookup/206746194=YOUR_KEY?region=IND",
+        "optional_jwt":   "/api/lookup/206746194=YOUR_KEY?region=IND&jwt=eyJ...",
         "regions": sorted(VALID_REGIONS),
         "default_region": DEFAULT_REGION,
     })
@@ -1022,7 +1079,7 @@ def health():
 
 
 # ═══════════════════════════════════════════════════════════
-#  PRIMARY ENDPOINT
+#  ⭐ PRIMARY ENDPOINT
 # ═══════════════════════════════════════════════════════════
 @app.route("/api/lookup/<path:combined>", methods=["GET"])
 def api_lookup(combined):
@@ -1030,7 +1087,7 @@ def api_lookup(combined):
         if "=" not in combined:
             return jsonify({
                 "ok": False,
-                "error": "URL format: /api/lookup/<id>=<api_key>?region=IND",
+                "error": "format: /api/lookup/<id>=<api_key>?region=IND",
                 "example": "/api/lookup/206746194=YOUR_KEY?region=IND",
             }), 400
 
@@ -1051,6 +1108,7 @@ def api_lookup(combined):
                 "error": f"invalid region '{region_in}' — valid: {sorted(VALID_REGIONS)}",
             }), 400
 
+        # resolve: saved UID → account_id + its JWT, else raw account_id
         saved_acc = None
         for acc in _load_accounts():
             if str(acc.get("uid")) == aid_part:
@@ -1069,41 +1127,75 @@ def api_lookup(combined):
 
         log_info(f"lookup → id={aid_part} ({matched_by}) region={region_code}")
 
+        # ─── JWT priority: query param → saved → cache → ephemeral ───
+        user_jwt = (request.args.get("jwt") or "").strip()
+        if user_jwt and user_jwt.startswith("eyJ"):
+            jwt = user_jwt
+            log_info("using JWT from query param")
         if not jwt:
-            jwt, _ = _get_saved_jwt()
+            sj, _ = _get_saved_jwt(region_code)
+            if sj:
+                jwt = sj
+                log_info("using saved JWT")
+        if not jwt:
+            jwt = cache_get_jwt(region_code)
+            if jwt:
+                log_info("using cached JWT")
 
         s = new_session()
-        info = None
-        host = None
+
+        # Try with current JWT (or none → will 401 if bad)
         try:
-            info, host = fetch_player_info(s, account_id, jwt=jwt, region=region_code,
-                                           auto_jwt=bool(jwt))
+            info, host = fetch_player_info(s, account_id, jwt=jwt,
+                                            region=region_code,
+                                            requested_aid=account_id)
         except Exception as e:
             err_str = str(e)
-            if "401" in err_str or "no host" in err_str or "JWT" in err_str:
-                log_warn("lookup: no valid JWT — generating ephemeral")
-                jwt = get_ephemeral_jwt(region_code)
-                if jwt:
-                    try:
-                        info, host = fetch_player_info(s, account_id, jwt=jwt,
-                                                       region=region_code, auto_jwt=False)
-                    except Exception as e2:
-                        return jsonify({
-                            "ok": False, "error": str(e2),
-                            "account_id": account_id, "region": region_code,
-                        }), 502
-                else:
+            log_warn(f"lookup attempt 1 failed: {err_str}")
+
+            # Last resort: ephemeral JWT
+            if not jwt or "401" in err_str:
+                log_warn("no valid JWT — creating ephemeral")
+                eph_jwt = get_ephemeral_jwt(region_code)
+                if not eph_jwt:
                     return jsonify({
                         "ok": False,
-                        "error": "could not obtain JWT for lookup",
+                        "error": "could not obtain valid JWT",
+                        "account_id": account_id,
+                        "region": region_code,
+                        "hint": ("generate an account first, or pass "
+                                 "&jwt=eyJ... in URL"),
+                    }), 502
+                try:
+                    info, host = fetch_player_info(s, account_id, jwt=eph_jwt,
+                                                    region=region_code,
+                                                    requested_aid=account_id)
+                except Exception as e2:
+                    return jsonify({
+                        "ok": False,
+                        "error": str(e2),
                         "account_id": account_id,
                         "region": region_code,
                     }), 502
             else:
                 return jsonify({
-                    "ok": False, "error": err_str,
-                    "account_id": account_id, "region": region_code,
+                    "ok": False,
+                    "error": err_str,
+                    "account_id": account_id,
+                    "region": region_code,
                 }), 502
+
+        # ⭐ Final safety check — returned account_id must match requested
+        returned_aid = _extract_response_account_id(info)
+        if returned_aid is not None and int(returned_aid) != int(account_id):
+            return jsonify({
+                "ok": False,
+                "error": "server returned wrong account",
+                "requested_account_id": account_id,
+                "returned_account_id": returned_aid,
+                "region": region_code,
+                "hint": "server is returning JWT-owner data — pass &jwt=YOUR_OWN",
+            }), 502
 
         banned, ban_reason = is_banned(info)
         profile = extract_verified(info)
@@ -1259,9 +1351,6 @@ def internal_error(e):
     return jsonify({"ok": False, "error": "internal server error"}), 500
 
 
-# ═══════════════════════════════════════════════════════════
-#  LOCAL ENTRYPOINT
-# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, threaded=True)
